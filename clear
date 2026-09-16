@@ -1,0 +1,270 @@
+#define DISKCLEANER_EXPORTS
+#include "DiskCleaner.h"
+
+#include <windows.h>
+#include <shlobj.h>
+#include <string>
+#include <vector>
+#include <filesystem>
+
+namespace fs = std::filesystem;
+
+static std::string g_lastError;
+
+// ---------- Вспомогательные функции ----------
+
+static void SetError(const std::string& msg) {
+    g_lastError = msg;
+}
+
+// Рекурсивно удаляет содержимое папки (саму папку не трогает).
+// Возвращает освобождённые байты.
+static long long ClearFolderContents(const std::wstring& folder) {
+    long long freed = 0;
+    std::error_code ec;
+
+    if (!fs::exists(folder, ec) || !fs::is_directory(folder, ec))
+        return 0;
+
+    for (auto& entry : fs::directory_iterator(
+             folder, fs::directory_options::skip_permission_denied, ec)) {
+        std::error_code e;
+        uintmax_t size = 0;
+
+        try {
+            if (fs::is_regular_file(entry.path(), e)) {
+                size = fs::file_size(entry.path(), e);
+                if (!e && fs::remove(entry.path(), e))
+                    freed += (long long)size;
+            }
+            else if (fs::is_directory(entry.path(), e)) {
+                for (auto& sub : fs::recursive_directory_iterator(
+                         entry.path(),
+                         fs::directory_options::skip_permission_denied, e)) {
+                    if (fs::is_regular_file(sub.path(), e)) {
+                        uintmax_t s = fs::file_size(sub.path(), e);
+                        if (!e) size += s;
+                    }
+                }
+                fs::remove_all(entry.path(), e);
+                if (!e) freed += (long long)size;
+            }
+        } catch (...) {
+            // пропускаем занятые/защищённые файлы
+        }
+    }
+    return freed;
+}
+
+// Корзина (всех дисков сразу)
+static long long EmptyRecycleBin() {
+    HRESULT hr = SHEmptyRecycleBinW(nullptr, nullptr,
+                                    SHERB_NOCONFIRMATION |
+                                    SHERB_NOPROGRESSUI |
+                                    SHERB_NOSOUND);
+    return SUCCEEDED(hr) ? 1 : 0;
+}
+
+// ========== Очистка кэша Windows Update ==========
+static long long ClearWindowsUpdateCache() {
+    long long freed = 0;
+    std::error_code ec;
+
+    // Останавливаем службы
+    system("net stop wuauserv /y >nul 2>&1");
+    system("net stop bits /y >nul 2>&1");
+    Sleep(1000);
+
+    std::wstring updateCache = L"C:\\Windows\\SoftwareDistribution\\Download";
+    if (fs::exists(updateCache, ec)) {
+        freed += ClearFolderContents(updateCache);
+    }
+
+    // Запускаем службы обратно
+    system("net start wuauserv >nul 2>&1");
+    system("net start bits >nul 2>&1");
+
+    return freed;
+}
+
+// ========== Очистка кэша шейдеров ==========
+static long long ClearShaderCaches() {
+    long long freed = 0;
+    wchar_t buf[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH))
+        return 0;
+    std::wstring localAppData = buf;
+
+    freed += ClearFolderContents(localAppData + L"\\D3DSCache");
+
+    // NVIDIA
+    freed += ClearFolderContents(localAppData + L"\\NVIDIA\\DXCache");
+    freed += ClearFolderContents(localAppData + L"\\NVIDIA\\GLCache");
+    freed += ClearFolderContents(localAppData + L"\\NVIDIA\\NV_Cache");
+
+    // AMD
+    freed += ClearFolderContents(localAppData + L"\\AMD\\DxCache");
+    freed += ClearFolderContents(localAppData + L"\\AMD\\GLCache");
+
+    // Intel
+    freed += ClearFolderContents(localAppData + L"\\Intel\\ShaderCache");
+
+    return freed;
+}
+
+// ========== Очистка кэша миниатюр и иконок ==========
+static long long ClearThumbnailAndIconCache() {
+    long long freed = 0;
+    wchar_t buf[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH))
+        return 0;
+
+    std::wstring explorerCache =
+        std::wstring(buf) + L"\\Microsoft\\Windows\\Explorer";
+
+    std::error_code ec;
+    if (!fs::exists(explorerCache, ec)) return 0;
+
+    for (auto& e : fs::directory_iterator(explorerCache,
+             fs::directory_options::skip_permission_denied, ec)) {
+        std::wstring name = e.path().filename().wstring();
+        if (name.find(L"thumbcache_") == 0 ||
+            name.find(L"iconcache_")  == 0) {
+            uintmax_t sz = fs::file_size(e.path(), ec);
+            if (!ec && fs::remove(e.path(), ec))
+                freed += (long long)sz;
+        }
+    }
+    return freed;
+}
+
+// ========== Очистка кэша браузера (Chrome/Edge) ==========
+static long long ClearBrowserCache(const std::wstring& browserRoot) {
+    long long freed = 0;
+    std::error_code ec;
+    if (!fs::exists(browserRoot, ec)) return 0;
+
+    const std::vector<std::wstring> cacheDirs = {
+        L"\\Cache\\Cache_Data",
+        L"\\Code Cache",
+        L"\\GPUCache",
+        L"\\DawnCache",
+        L"\\GrShaderCache",
+        L"\\ShaderCache",
+        L"\\Media Cache",
+        L"\\Service Worker\\CacheStorage",
+        L"\\Service Worker\\ScriptCache"
+    };
+
+    for (auto& sub : cacheDirs) {
+        freed += ClearFolderContents(browserRoot + sub);
+    }
+    return freed;
+}
+
+// ========== Экспортируемые функции ==========
+
+extern "C" DC_API int GetDiskCount() {
+    DWORD mask = GetLogicalDrives();
+    int count = 0;
+    for (int i = 0; i < 26; ++i)
+        if (mask & (1 << i)) count++;
+    return count;
+}
+
+extern "C" DC_API int GetDiskLetters(char* buffer, int bufferSize) {
+    if (!buffer || bufferSize < 4) return 0;
+    DWORD mask = GetLogicalDrives();
+    int written = 0;
+    buffer[0] = '\0';
+
+    for (int i = 0; i < 26; ++i) {
+        if (mask & (1 << i)) {
+            char letter[4] = { (char)('A' + i), ':', '\\', '\0' };
+            if (written + 4 >= bufferSize) break;
+            memcpy(buffer + written, letter, 4);
+            written += 4;
+        }
+    }
+    return written / 4;
+}
+
+extern "C" DC_API long long CleanDisk(const char* driveLetter) {
+    if (!driveLetter || strlen(driveLetter) < 2) {
+        SetError("Invalid drive letter");
+        return -1;
+    }
+
+    std::string drive(driveLetter, 2);                 // "D:"
+    std::wstring wdrive(drive.begin(), drive.end());   // L"D:"
+    long long totalFreed = 0;
+
+    // ===== Общие для любого диска =====
+    totalFreed += ClearFolderContents(wdrive + L"\\Temp");
+    totalFreed += ClearFolderContents(wdrive + L"\\Windows\\Temp");
+    totalFreed += ClearFolderContents(wdrive + L"\\$Recycle.Bin");
+
+    // ===== Только для системного диска =====
+    char sysDrive[4] = {0};
+    GetWindowsDirectoryA(sysDrive, 4);
+
+    if (_strnicmp(drive.c_str(), sysDrive, 2) == 0) {
+        // Windows Temp + пользовательский Temp
+        wchar_t winDir[MAX_PATH];
+        if (GetWindowsDirectoryW(winDir, MAX_PATH)) {
+            totalFreed += ClearFolderContents(std::wstring(winDir) + L"\\Temp");
+            totalFreed += ClearFolderContents(std::wstring(winDir) + L"\\Prefetch");
+        }
+        wchar_t userTemp[MAX_PATH];
+        if (GetTempPathW(MAX_PATH, userTemp))
+            totalFreed += ClearFolderContents(userTemp);
+
+        // Кэш Windows Update
+        totalFreed += ClearWindowsUpdateCache();
+
+        // Шейдеры GPU / DirectX
+        totalFreed += ClearShaderCaches();
+
+        // Миниатюры и иконки
+        totalFreed += ClearThumbnailAndIconCache();
+
+        // Кэш браузеров
+        // ВНИМАНИЕ: если браузеры открыты — файлы залочены, кэш не удалится.
+        wchar_t userProfile[MAX_PATH];
+        if (GetEnvironmentVariableW(L"USERPROFILE", userProfile, MAX_PATH)) {
+            std::wstring up(userProfile);
+            totalFreed += ClearBrowserCache(
+                up + L"\\AppData\\Local\\Google\\Chrome\\User Data\\Default");
+            totalFreed += ClearBrowserCache(
+                up + L"\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default");
+        }
+    }
+
+    // Корзина — глобально (все диски)
+    EmptyRecycleBin();
+
+    return totalFreed;
+}
+
+extern "C" DC_API long long CleanCAndD() {
+    long long total = 0;
+    total += CleanDisk("C:");
+    total += CleanDisk("D:");
+    return total;
+}
+
+extern "C" DC_API long long CleanAllDisks() {
+    long long total = 0;
+    DWORD mask = GetLogicalDrives();
+    for (int i = 0; i < 26; ++i) {
+        if (mask & (1 << i)) {
+            char letter[4] = { (char)('A' + i), ':', '\0' };
+            total += CleanDisk(letter);
+        }
+    }
+    return total;
+}
+
+extern "C" DC_API const char* GetLastErrorMsg() {
+    return g_lastError.c_str();
+}
